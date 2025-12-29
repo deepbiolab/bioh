@@ -1,5 +1,5 @@
 [project]
-name = "hybrid-modeling-of-bioreactor-with-lstm-main"
+name = "deep-modeling-of-bioreactor"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
