@@ -129,55 +129,189 @@ class WeightedMSELoss(nn.Module):
         return torch.mean(weighted_diff)
 
 # ==============================================================================
-# 3. Hybrid LSTM Model (Architecture matching Table 1 Best LSTM)
+# 3. Hybrid Models (LSTM & FFNN)
 # ==============================================================================
 class HybridLSTM(nn.Module):
+    """
+    Best LSTM Architecture: In(27)-ReLU(16)-LSTM(7)-Rate(7)
+    """
     def __init__(self, S_matrix, input_dim=27, hidden_dim=16, latent_dim=7, device='cpu'):
         super().__init__()
         self.device = device
         
         # 1. Register S Matrix (Frozen)
-        # S shape: (25, 7) -> (n_species, n_latent)
         self.S = torch.tensor(S_matrix, dtype=torch.float32).to(device)
         self.register_buffer('S_const', self.S)
         
-        # 2. Architecture: In(27) -> ReLU(16) -> LSTM(7) -> Rate(7)
-        # Note: LSTM input size = hidden_dim (16)
+        # 2. Encoder
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1) # Paper specifies 0.1 dropout
+            nn.Dropout(0.1)
         )
         
-        # LSTM Layer
-        # hidden_size = latent_dim (7) as per paper notation "LSTM(7)"
+        # 3. LSTM Layer
         self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=latent_dim, batch_first=True)
         self.lstm_dropout = nn.Dropout(0.1)
         
-        # Output Mapping (Optional linear layer to map LSTM state to Rates)
-        # If LSTM hidden size is 7, this layer maps 7->7, allowing scaling flexibility
+        # 4. Output Mapping
         self.fc_out = nn.Linear(latent_dim, latent_dim) 
         
     def forward(self, x_seq, hidden_state=None):
         batch_size, seq_len, _ = x_seq.shape
         
-        # 1. Feedforward Encoder
         x_flat = x_seq.reshape(-1, x_seq.size(2))
         features = self.encoder(x_flat)
         features = features.reshape(batch_size, seq_len, -1)
         
-        # 2. LSTM
         lstm_out, new_hidden = self.lstm(features, hidden_state)
         lstm_out = self.lstm_dropout(lstm_out)
         
-        # 3. Output Scores (Latent Rates)
         scores = self.fc_out(lstm_out)
         
-        # 4. Hybrid Layer: dMr = Scores @ S.T
-        # (B, T, 7) @ (7, 25) -> (B, T, 25)
+        # Hybrid Layer: dMr = Scores @ S.T
         delta_mr = torch.matmul(scores, self.S.t())
         
         return delta_mr, new_hidden
+
+class HybridFFNN(nn.Module):
+    """
+    Best FFNN Architecture: In(27)-Tanh(8)-Tanh(8)-Tanh(8)-Tanh(7)-Rate(7)
+    """
+    def __init__(self, S_matrix, input_dim=27, latent_dim=7, device='cpu'):
+        super().__init__()
+        self.device = device
+        
+        # 1. Register S Matrix (Frozen)
+        self.S = torch.tensor(S_matrix, dtype=torch.float32).to(device)
+        self.register_buffer('S_const', self.S)
+        
+        # 2. Architecture (4 Tanh hidden layers)
+        # Layer dims: 27 -> 8 -> 8 -> 8 -> 7 -> 7
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 8),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(8, 8),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(8, 8),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(8, 7), # Corresponds to Tanh(7) layer
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(7, latent_dim) # Rate(7) Output Layer
+        )
+        
+    def forward(self, x_seq, hidden_state=None):
+        # FFNN treats sequence as batch of independent time points
+        batch_size, seq_len, _ = x_seq.shape
+        
+        x_flat = x_seq.reshape(-1, x_seq.size(2))
+        scores_flat = self.net(x_flat)
+        scores = scores_flat.reshape(batch_size, seq_len, -1)
+        
+        # Hybrid Layer: dMr = Scores @ S.T
+        delta_mr = torch.matmul(scores, self.S.t())
+        
+        # Return None for hidden state compatibility
+        return delta_mr, None
+
+# ==============================================================================
+# Helper for Transformer: Positional Encoding
+# ==============================================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        # 创建位置编码矩阵 (1, max_len, d_model)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        # x: (Batch, Seq_Len, d_model)
+        # 添加位置编码 (Broadcasting)
+        x = x + self.pe[:, :x.size(1), :]
+        return x
+
+class HybridTransformer(nn.Module):
+    """
+    Lightweight Transformer: 
+    Input(27) -> Linear(16) -> PosEnc -> TransformerEncoder(d_model=16, nhead=2) -> Linear(7)
+    参数量设计对标 LSTM (~1.5k params)
+    """
+    def __init__(self, S_matrix, input_dim=27, latent_dim=7, device='cpu'):
+        super().__init__()
+        self.device = device
+        
+        # 1. 冻结 S 矩阵
+        self.S = torch.tensor(S_matrix, dtype=torch.float32).to(device)
+        self.register_buffer('S_const', self.S)
+        
+        # 参数配置 (旨在保持轻量级)
+        self.d_model = 32  # 嵌入维度 (对应 LSTM hidden_dim)
+        nhead = 4          # 多头注意力头数
+        num_layers = 2     # Encoder 层数 (浅层网络)
+        dim_feedforward = 32 # FFN 内部维度 (通常是 d_model 的 2-4 倍)
+        
+        # 2. Input Embedding
+        self.embedding = nn.Linear(input_dim, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model)
+        self.dropout = nn.Dropout(0.1)
+        
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, 
+            nhead=nhead, 
+            dim_feedforward=dim_feedforward, 
+            dropout=0.1, 
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 4. Output Projection
+        self.fc_out = nn.Linear(self.d_model, latent_dim)
+        
+    def _generate_square_subsequent_mask(self, sz):
+        # 生成因果掩码 (Causal Mask)
+        # 确保 t 时刻的预测只能看到 0...t 时刻的数据，不能看到未来
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask.to(self.device)
+
+    def forward(self, x_seq, hidden_state=None):
+        # x_seq: (Batch, Seq_Len, 27)
+        batch_size, seq_len, _ = x_seq.shape
+        
+        # Embedding & Positional Encoding
+        x = self.embedding(x_seq) # (B, S, 16)
+        x = self.pos_encoder(x)
+        x = self.dropout(x)
+        
+        # Causal Masking (关键：防止这一步看到未来的数据)
+        mask = self._generate_square_subsequent_mask(seq_len)
+        
+        # Transformer Forward
+        # Output: (B, S, 16)
+        x_trans = self.transformer_encoder(x, mask=mask)
+        
+        # Output Projection -> Scores
+        scores = self.fc_out(x_trans) # (B, S, 7)
+        
+        # Hybrid Layer: dMr = Scores @ S.T
+        delta_mr = torch.matmul(scores, self.S.t())
+        
+        # Transformer 是无状态的 (Stateless)，hidden_state 仅为保持接口一致返回 None
+        return delta_mr, None
 
 # ==============================================================================
 # 4. Physics-Informed Trainer
@@ -197,20 +331,9 @@ class HybridTrainer:
 
     def physics_step(self, mr_curr, dMr_pred, accum_next=None):
         """
-        Discrete Physics Update (Equation S1.3 Logic)
-        
-        Training Mode:
-            Total_Mass(t+1) = (Mr(t) + dMr_pred) + Accum_GT(t+1)
-            We use Ground Truth Accumulation to decouple physics errors from NN errors.
+        Discrete Physics Update
         """
-        # 1. Update Reacted Mass
         mr_next_pred = mr_curr + dMr_pred
-        
-        # In Training, we stop here because we compute Loss on Mr directly.
-        # But if we wanted to compute Concentration Loss:
-        # total_mass_next = mr_next_pred + accum_next
-        # c_next_pred = total_mass_next / v_next
-        
         return mr_next_pred
 
     def train_epoch(self):
@@ -224,18 +347,15 @@ class HybridTrainer:
             # Predict dMr sequence
             pred_dMr_seq, _ = self.model(inputs)
             
-            # Teacher Forcing: Use Ground Truth previous step to predict next step
-            # t = 0 to T-1
+            # Teacher Forcing
             mr_curr = target_mr[:, :-1, :]       
             mr_next_target = target_mr[:, 1:, :] 
-            
-            # NN Prediction corresponding to t -> t+1 change
             dMr_pred = pred_dMr_seq[:, :-1, :]   
             
             # Physics Update
             mr_next_pred = self.physics_step(mr_curr, dMr_pred)
             
-            # Loss Calculation (Weighted MSE)
+            # Loss Calculation
             loss = self.criterion(mr_next_pred, mr_next_target)
             
             self.optimizer.zero_grad()
@@ -297,7 +417,7 @@ class HybridTrainer:
         return self.history
 
 # ==============================================================================
-# Helper: Load Feed Concs (Legacy Logic)
+# Helper: Load Feed Concs
 # ==============================================================================
 def get_feed_concs_dict(file_path):
     df_raw = pd.read_excel(file_path, sheet_name='feed conc')
@@ -317,6 +437,10 @@ def get_feed_concs_dict(file_path):
 # 5. Execution Block
 # ==============================================================================
 if __name__ == "__main__":
+    # --- MODEL TYPE PARAMETER ---
+    MODEL_TYPE = 'LSTM' # Options: 'LSTM', 'FFNN', 'Transformer'
+    # ----------------------------
+
     # Settings
     DATA_FILE = 'processed_data_IR_final.csv'
     ORIGINAL_FILE = 'data/data.xlsx'
@@ -333,7 +457,6 @@ if __name__ == "__main__":
     
     feed_concs = get_feed_concs_dict(ORIGINAL_FILE)
     
-    # Define Column Order (Must match S Matrix)
     met_list = ['Ala', 'Arg', 'Asn', 'Asp', 'Cys', 'Glc', 'Gln', 'Glu', 'Pyr', 
                 'Gly', 'His', 'Ile', 'Lac', 'Leu', 'Lys', 'Met', 'Nh4', 'Phe', 
                 'Pro', 'Ser', 'Thr', 'Tyr', 'Val']
@@ -343,30 +466,41 @@ if __name__ == "__main__":
     # 2. Prepare Data
     train_loader, val_loader, test_loader, scaler = prepare_dataloaders(df, species_cols, mr_cols, feed_concs)
     
-    # 3. Calculate Max Vals for Loss Weighting (From Training Data)
+    # 3. Calculate Max Vals
     all_train_mr = []
     for batch in train_loader:
         all_train_mr.append(batch['mr'].numpy())
     all_train_mr = np.vstack(all_train_mr)
-    # Flatten Batch and Seq dimensions -> (N, 25)
     all_train_mr = all_train_mr.reshape(-1, 25)
     max_mr_vals = np.max(np.abs(all_train_mr), axis=0)
     max_mr_vals[max_mr_vals == 0] = 1.0
     
-    print(f"\n[Model] Initializing HybridLSTM (Input=27, Hidden=16, Latent=7)...")
+    # 4. Initialize Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HybridLSTM(S_matrix, input_dim=27, hidden_dim=16, latent_dim=7, device=device)
+    print(f"\n[Model] Initializing Hybrid{MODEL_TYPE}...")
+    
+    if MODEL_TYPE == 'LSTM':
+        model = HybridLSTM(S_matrix, input_dim=27, hidden_dim=16, latent_dim=7, device=device)
+        save_name = 'hybrid_lstm_model.pth'
+    elif MODEL_TYPE == 'FFNN':
+        model = HybridFFNN(S_matrix, input_dim=27, latent_dim=7, device=device)
+        save_name = 'hybrid_ffnn_model.pth'
+    elif MODEL_TYPE == 'Transformer':
+        model = HybridTransformer(S_matrix, input_dim=27, latent_dim=7, device=device)
+        save_name = 'hybrid_transformer_model.pth'        
+    else:
+        raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
     
     print(f"[Training] Starting loop on {device}...")
     trainer = HybridTrainer(model, train_loader, val_loader, max_mr_vals, device)
-    history = trainer.fit(epochs=500, patience=50) # Use 500 epochs with early stopping
+    history = trainer.fit(epochs=500, patience=50) 
     
-    # 4. Save Artifacts
-    torch.save(model.state_dict(), 'hybrid_lstm_model.pth')
+    # 5. Save
+    torch.save(model.state_dict(), save_name)
     with open('scaler.pkl', 'wb') as f:
         pickle.dump(scaler, f)
         
-    print("\n✅ Verification Passed: Model trained and saved.")
+    print(f"\n✅ Verification Passed: {MODEL_TYPE} Model trained and saved to {save_name}.")
     
     # Plot
     plt.figure(figsize=(10, 5))
@@ -375,7 +509,6 @@ if __name__ == "__main__":
     plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Weighted MSE')
-    plt.title('Hybrid Model Training Progress')
+    plt.title(f'Hybrid {MODEL_TYPE} Training Progress')
     plt.legend()
     plt.savefig('training_curve.png')
-    # plt.show()
